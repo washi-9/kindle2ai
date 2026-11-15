@@ -270,12 +270,6 @@ def cmd_build(args) -> int:
     except FileNotFoundError as e:
         return _err(str(e))
 
-    per_page = pipeline.assemble(pages, fill_threshold=args.fill_threshold,
-                                 keep_running=args.keep_headers)
-    blocks = pipeline.stitch(per_page)
-    if not blocks:
-        return _err("no text recovered - check out/pages/*.png and OCR settings")
-
     title, asin = args.title, args.asin
     state = outdir / "state.json"
     if state.exists():
@@ -288,6 +282,12 @@ def cmd_build(args) -> int:
         if not title and window_title and window_title != "Kindle":
             title = window_title
     title = title or outdir.name
+
+    per_page = pipeline.assemble(pages, fill_threshold=args.fill_threshold,
+                                 keep_running=args.keep_headers, title=title)
+    blocks = pipeline.stitch(per_page)
+    if not blocks:
+        return _err("no text recovered - check out/pages/*.png and OCR settings")
 
     meta = export.build_meta(title, "kindle-app-capture", len(pages), asin)
     written = export.write_all(outdir, meta, blocks, _formats(args.formats),

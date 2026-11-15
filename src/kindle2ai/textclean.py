@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections import Counter
+from difflib import SequenceMatcher
 
 # Characters Vision occasionally emits that carry no meaning.
 _INVISIBLE = dict.fromkeys(map(ord, "​‌‍⁠﻿­"), None)
@@ -194,6 +195,84 @@ def find_running_elements(pages: list[list[str]], edge: int = 2,
             counts[fp] += 1
     threshold = max(3, int(len(pages) * min_ratio))
     return {fp for fp, n in counts.items() if n >= threshold and len(fp) <= 80}
+
+
+# Kindle prints the book's title at the top of every page. Matching it
+# exactly fails: OCR splits a long title over two or three lines, cuts it off,
+# and reads its "――" as "一一", "ーー" or "-". So titles are compared on their
+# letters alone, with dash look-alikes removed.
+_DASH_LIKE = re.compile(r"[一ー―‐-]{2,}|[―‐-]")
+
+
+def _letters(text: str) -> str:
+    text = _DASH_LIKE.sub("", unicodedata.normalize("NFKC", text))
+    return "".join(ch for ch in text if unicodedata.category(ch)[0] in "LN")
+
+
+# Below this many letters a title is too likely to occur in the text itself
+# ("走れ！メロス" in 走れメロス); short titles are left to running-head
+# detection, which catches them because OCR reads them consistently.
+MIN_TITLE_LETTERS = 8
+
+
+def _title_pattern(title: str) -> re.Pattern | None:
+    """The title glued to the start or end of a line, with its brackets."""
+    letters = _letters(title)
+    if len(letters) < MIN_TITLE_LETTERS:
+        return None
+    gap = r"(?:[\W_]|[一ー―])*"
+    core = r"[\W_]*" + gap.join(re.escape(ch) for ch in letters) + r"[\W_]*"
+    return re.compile(rf"^{core}|{core}$")
+
+
+def strip_title(lines: list[str], title: str) -> list[str]:
+    """`lines` with the book's running title removed (see title_cuts)."""
+    return [t for t in title_cuts(lines, title) if t is not None]
+
+
+def title_cuts(lines: list[str], title: str) -> list[str | None]:
+    """Each line with the book's running title removed; None if it goes.
+
+    A line made only of the title, or of a piece of it, is dropped; a title
+    glued to other text is cut out of it. Short pieces such as "[改訂版]" go
+    only when they sit next to another piece, so a body line that happens to
+    be a word from the title survives.
+    """
+    letters = _letters(title)
+    pattern = _title_pattern(title)
+    if not pattern:
+        return list(lines)
+    out = []
+    for line in lines:
+        cut = pattern.sub("", line)
+        # Cutting the title out of a line can leave only its punctuation.
+        out.append("" if cut != line and not _letters(cut) else cut)
+
+    def piece(line: str) -> int:
+        """Letters in the line if it is wholly a piece of the title, else 0."""
+        own = _letters(line)
+        return len(own) if own and own in letters else 0
+
+    def misread(line: str) -> bool:
+        """The whole title, read with a few characters wrong ("次訂版",
+        "かεはじめよ") -- close to it in length and mostly the same letters."""
+        own = _letters(line)
+        if len(letters) < MIN_TITLE_LETTERS or \
+                not 0.6 * len(letters) <= len(own) <= 1.3 * len(letters):
+            return False
+        return SequenceMatcher(None, own, letters).ratio() >= 0.75
+
+    out = ["" if misread(line) else line for line in out]
+    sizes = [piece(l) for l in out]
+    result: list[str | None] = []
+    for i, line in enumerate(out):
+        size = sizes[i]
+        neighbour = (i > 0 and sizes[i - 1] >= 5) or (i + 1 < len(out) and sizes[i + 1] >= 5)
+        if not line.strip() or size >= 5 or (size >= 2 and neighbour):
+            result.append(None)
+        else:
+            result.append(line)
+    return result
 
 
 def keep_indices(lines: list[str], running: set[str], edge: int = 2) -> list[int]:

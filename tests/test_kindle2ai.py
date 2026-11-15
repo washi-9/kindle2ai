@@ -386,6 +386,40 @@ class TestPageTurnDirection(unittest.TestCase):
         self.assertIsNone(capture.parse_location("章を読み終えるまで1分・13%"))
 
 
+class TestRunningTitle(unittest.TestCase):
+    TITLE = "イシューからはじめよ［改訂版］――知的生産の「シンプルな本質」"
+
+    def strip(self, lines):
+        return textclean.strip_title(lines, self.TITLE)
+
+    def test_title_in_ocr_variants_is_removed(self):
+        for line in ("イシューからはじめよ[改訂版]一一知的生産の「シンプルな本質」",
+                     "イシューからはじめよ[改訂版] -知的生産の「シンプルな本質」",
+                     "イシューからはじめよ[改訂版]一一知的生産の「シン"):
+            self.assertEqual(self.strip([line, "本文の一行目です。"]), ["本文の一行目です。"], line)
+
+    def test_title_split_over_lines_is_removed(self):
+        self.assertEqual(self.strip(["イシューからはじめよ", "[改訂版]",
+                                     "-知的生産の「シンプルな本質」", "本文"]), ["本文"])
+
+    def test_title_glued_to_other_text_is_cut_out(self):
+        self.assertEqual(self.strip(["見出しイシューからはじめよ[改訂版]一一知的生産の「シンプルな本質」"]),
+                         ["見出し"])
+
+    def test_title_read_with_a_few_wrong_characters_is_removed(self):
+        for line in ("イシューかεはじめよ[改訂版]--知的生産の「シンプルな本質」",
+                     "イシューからはじめよ[次訂版]--知的生産の「シンプルな本質」",
+                     "イシューからはじめよ[改訂版]------「シンプルな本質」",
+                     "イシューからはじめよ[改訂版]-知的生産の「シンプ):本質」"):
+            self.assertEqual(self.strip([line, "本文。"]), ["本文。"], line)
+
+    def test_body_lines_using_words_from_the_title_survive(self):
+        lines = ["「イシューからはじめる」アプローチ", "知的生産について考える。", "改訂版",
+                 "なぜ今『イシューからはじめよ』なのか",
+                 "「僕は今、自分にできる限りの深いレベルまで、知的生産におけるシンプルな本質を伝えた。"]
+        self.assertEqual(self.strip(lines), lines)
+
+
 class TestUINoise(unittest.TestCase):
     def test_kindle_chrome_is_noise(self):
         for s in ["位置No. 1,234 of 6,420", "45%", "残り 3 時間",

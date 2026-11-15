@@ -9,10 +9,11 @@ from pathlib import Path
 
 from . import layout, native, ndlocr, tess, textclean
 
-# How many pages to try both engines on before committing to one. Judging from
-# a single page is unreliable: a chapter opener or a figure page is sparse for
-# both engines and says nothing about the rest of the book.
-PROBE_PAGES = 3
+# How many pages vote on whether a book is vertical. Judging from a few is
+# unreliable: covers, chapter openers and figure pages misrepresent the body.
+PROBE_PAGES = 7
+# A probe page with less text than this from either reader does not vote.
+PROBE_MIN_CHARS = 80
 
 # Tesseract must win by this margin to displace Vision, which is faster and
 # needs no extra install.
@@ -44,8 +45,16 @@ def prepare_image(image: Path, workdir: Path,
             and not strip_ruby):
         return image
     dest = workdir / (image.stem + ("_noruby" if strip_ruby else "_prep") + ".png")
-    native.prep(image, dest, crop=crop, scale=scale,
-                contrast=contrast, binarize=binarize, strip_ruby=strip_ruby)
+    try:
+        native.prep(image, dest, crop=crop, scale=scale,
+                    contrast=contrast, binarize=binarize, strip_ruby=strip_ruby)
+    except native.NativeError:
+        if not strip_ruby:
+            raise
+        # Ruby removal is an accuracy gain, not a requirement: one odd page
+        # must not stop the whole book.
+        native.prep(image, dest, crop=crop, scale=scale,
+                    contrast=contrast, binarize=binarize)
     return dest
 
 
@@ -107,17 +116,23 @@ def choose_engine(images: list[Path], langs: str, engine: str,
             )
         return "tesseract", tlang
 
-    step = max(1, len(images) // PROBE_PAGES)
-    probes = images[::step][:PROBE_PAGES] or images[:1]
-
+    probes = _probe_pages(images)
     if prepare:
         probes = [prepare(p) for p in probes]
-    vision_chars = sum(_char_count(native.ocr(p, langs=langs)["lines"])
-                       for p in probes)
-    if not tess.is_ready(tlang):
-        if vision_chars < 40 * len(probes) and (
-                ndlocr.is_ready() or native.livetext_available()):
-            return _vertical_engine(tlang)
+
+    # A second reader that copes with vertical text, to compare Vision with.
+    if native.livetext_available():
+        def vertical_reader(p):
+            return len(native.livetext(p, langs=langs)["text"])
+    elif tess.is_ready(tlang):
+        def vertical_reader(p):
+            return _char_count(tess.ocr(p, lang=tlang, vertical=True)["lines"])
+    else:
+        vertical_reader = None
+
+    if vertical_reader is None:
+        vision_chars = sum(_char_count(native.ocr(p, langs=langs)["lines"])
+                           for p in probes)
         if vision_chars < 40 * len(probes):
             raise native.NativeError(
                 f"Vision recognized only {vision_chars} characters across "
@@ -129,11 +144,34 @@ def choose_engine(images: list[Path], langs: str, engine: str,
             )
         return "vision", tlang
 
-    tess_chars = sum(_char_count(tess.ocr(p, lang=tlang, vertical=True)["lines"])
-                     for p in probes)
-    if tess_chars > vision_chars * ENGINE_MARGIN:
+    # Each page votes on its own. Summing characters across the probes once
+    # sent a vertical book to Vision: its cover and a figure page full of
+    # horizontal labels outweighed a body page Vision could not read at all
+    # (37 characters, against 432 from a vertical reader).
+    vertical_votes = horizontal_votes = 0
+    for p in probes:
+        vision = _char_count(native.ocr(p, langs=langs)["lines"])
+        other = vertical_reader(p)
+        if max(vision, other) < PROBE_MIN_CHARS:
+            continue  # blank, a picture, or a chapter title: says nothing
+        if other > vision * ENGINE_MARGIN:
+            vertical_votes += 1
+        else:
+            horizontal_votes += 1
+    if vertical_votes > horizontal_votes:
         return _vertical_engine(tlang)
     return "vision", tlang
+
+
+def _probe_pages(images: list[Path]) -> list[Path]:
+    """Pages spread over the body of the book, skipping the front and back
+    matter (covers, title pages, colophons) that misrepresent it."""
+    if len(images) <= PROBE_PAGES:
+        return list(images)
+    lo, hi = int(len(images) * 0.15), int(len(images) * 0.85)
+    step = (hi - lo) / (PROBE_PAGES - 1)
+    return [images[min(len(images) - 1, lo + round(i * step))]
+            for i in range(PROBE_PAGES)]
 
 
 def ocr_pages(outdir: Path, langs: str = "ja-JP,en-US", min_conf: float = 0.0,
@@ -280,8 +318,14 @@ def load_ocr(outdir: Path) -> list[dict]:
 
 
 def assemble(pages: list[dict], fill_threshold: float = 0.90,
-             keep_running: bool = False) -> list[dict]:
-    """Return per-page paragraph lists with headers/footers removed."""
+             keep_running: bool = False, title: str = "") -> list[dict]:
+    """Return per-page paragraph lists with headers/footers removed.
+
+    `title` is the book's title, which Kindle prints atop every page and OCR
+    reads in too many variants for running-head detection to catch.
+    """
+    if title and not keep_running:
+        pages = [{**p, "lines": _without_title(p["lines"], title)} for p in pages]
     raw_lines = [[l["text"] for l in p["lines"]] for p in pages]
     running = set() if keep_running else textclean.find_running_elements(raw_lines)
     japanese = textclean.is_japanese_document(
@@ -307,6 +351,12 @@ def assemble(pages: list[dict], fill_threshold: float = 0.90,
         paragraphs = textclean.build_paragraphs(entries, fill_threshold)
         out.append({"index": page["index"], "paragraphs": paragraphs})
     return out
+
+
+def _without_title(lines: list[dict], title: str) -> list[dict]:
+    """Line records minus the running title, keeping each line's fill/conf."""
+    cuts = textclean.title_cuts([l["text"] for l in lines], title)
+    return [{**line, "text": text} for line, text in zip(lines, cuts) if text is not None]
 
 
 def stitch(page_paragraphs: list[dict]) -> list[dict]:

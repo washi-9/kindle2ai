@@ -386,7 +386,7 @@ func stripVerticalRuby(_ buf: inout [UInt8], width w: Int, height h: Int) -> Int
     let narrow = Int(Double(column) * 0.6)
     let hug = max(2, column / 4)
 
-    var lastWideEnd = Int.min
+    var lastWideEnd: Int? = nil  // no full-width column seen yet
     var removed = 0
     for band in bands {
         let bw = band.end - band.start
@@ -394,7 +394,7 @@ func stripVerticalRuby(_ buf: inout [UInt8], width w: Int, height h: Int) -> Int
             lastWideEnd = band.end
             continue
         }
-        guard band.start - lastWideEnd <= hug else { continue }
+        guard let wideEnd = lastWideEnd, band.start - wideEnd <= hug else { continue }
         for y in 0..<h {
             let row = y * w
             for x in band.start..<band.end { buf[row + x] = 255 }
