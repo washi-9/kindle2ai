@@ -86,6 +86,11 @@ def dhash(image: Path) -> int:
     return int(run("dhash", str(image)).strip(), 16)
 
 
+def ink(image: Path, rect: tuple[float, float, float, float]) -> float:
+    """Share of dark pixels in rect = (x, y, w, h) as fractions of the image."""
+    return run_json("ink", str(image), "--rect", ",".join(map(str, rect)))["ink"]
+
+
 def compare(a: Path, b: Path, size: int = 256) -> dict:
     """{'mean_abs', 'changed_frac'} - how different two captures look."""
     return run_json("compare", str(a), str(b), "--size", str(size))

@@ -6,6 +6,7 @@
 //   livetext IMG [--langs ja-JP]  Live Text transcript (reads vertical text)
 //   dhash IMG                    64-bit perceptual hash (hex)
 //   compare A B [--size 256]     how different two captures are, as JSON
+//   ink IMG --rect x,y,w,h       share of dark pixels in a region
 //   prep IN OUT [options]        crop / scale / contrast / binarize for OCR
 //   pdftext PDF                  extract embedded text layer as JSON
 //   pdfrender PDF OUTDIR [--dpi 200]
@@ -232,6 +233,37 @@ func grayGrid(_ cg: CGImage, _ size: Int) -> [UInt8] {
     ctx.interpolationQuality = .medium
     ctx.draw(cg, in: CGRect(x: 0, y: 0, width: size, height: size))
     return buf
+}
+
+/// Share of dark pixels inside a rectangle given as fractions of the image
+/// (x,y,w,h, origin top-left). Used to tell whether Kindle's toolbar is up:
+/// its back-arrow and contents icons sit in the top-left corner, which is
+/// blank page margin when the toolbar is hidden.
+func cmdInk(_ args: [String]) {
+    guard let path = args.first, let rect = option(args, "rect") else {
+        die("usage: ink IMG --rect x,y,w,h")
+    }
+    let f = rect.split(separator: ",").compactMap { Double($0) }
+    guard f.count == 4 else { die("--rect needs four fractions: x,y,w,h") }
+    let cg = loadCGImage(path)
+    let W = cg.width, H = cg.height
+    var buf = [UInt8](repeating: 255, count: W * H)
+    guard let ctx = CGContext(data: &buf, width: W, height: H, bitsPerComponent: 8,
+                              bytesPerRow: W, space: CGColorSpaceCreateDeviceGray(),
+                              bitmapInfo: CGImageAlphaInfo.none.rawValue) else {
+        die("cannot create bitmap context")
+    }
+    ctx.draw(cg, in: CGRect(x: 0, y: 0, width: W, height: H))
+    let x0 = Int(f[0] * Double(W)), y0 = Int(f[1] * Double(H))
+    let x1 = min(W, x0 + Int(f[2] * Double(W))), y1 = min(H, y0 + Int(f[3] * Double(H)))
+    var dark = 0, total = 0
+    for y in max(0, y0)..<max(y0, y1) {
+        for x in max(0, x0)..<max(x0, x1) {
+            total += 1
+            if buf[y * W + x] < 128 { dark += 1 }
+        }
+    }
+    emit(["ink": total > 0 ? Double(dark) / Double(total) : 0.0])
 }
 
 func cmdCompare(_ args: [String]) {
@@ -478,15 +510,30 @@ func cmdPDFRender(_ args: [String]) {
 /// screencapture silently returns a desktop-only image when Screen Recording is
 /// denied, and key events are swallowed when Accessibility is denied, so the CLI
 /// checks both up front rather than producing 400 blank pages.
+// macOS grants Screen Recording and Accessibility to the "responsible"
+// process -- the app that launched this chain (a terminal, or Kindle2AI) --
+// not to this helper. Reporting it makes "granted but still refused" cases
+// diagnosable: the permission has to be on for exactly this app.
+@_silgen_name("responsibility_get_pid_responsible_for_pid")
+func responsibilityGetPidResponsibleForPid(_ pid: pid_t) -> pid_t
+
+func executablePath(_ pid: pid_t) -> String {
+    var buf = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+    let n = proc_pidpath(pid, &buf, UInt32(buf.count))
+    return n > 0 ? String(cString: buf) : ""
+}
+
 func cmdPerms(_ args: [String]) {
     if flag(args, "request") {
         if !CGPreflightScreenCaptureAccess() { CGRequestScreenCaptureAccess() }
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
         _ = AXIsProcessTrustedWithOptions(opts as CFDictionary)
     }
+    let responsible = responsibilityGetPidResponsibleForPid(getpid())
     emit([
         "screen_recording": CGPreflightScreenCaptureAccess(),
         "accessibility": AXIsProcessTrusted(),
+        "responsible": executablePath(responsible),
     ])
 }
 
@@ -504,6 +551,7 @@ case "ocr":       cmdOCR(rest)
 case "livetext":  cmdLiveText(rest)
 case "dhash":     cmdDHash(rest)
 case "compare":   cmdCompare(rest)
+case "ink":       cmdInk(rest)
 case "prep":      cmdPrep(rest)
 case "pdftext":   cmdPDFText(rest)
 case "pdfrender": cmdPDFRender(rest)

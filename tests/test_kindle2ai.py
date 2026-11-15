@@ -3,6 +3,7 @@
 Run: python3 -m unittest discover -s tests -v
 """
 
+import json
 import struct
 import sys
 import tempfile
@@ -159,6 +160,230 @@ class TestNDLOCR(unittest.TestCase):
         with mock.patch.object(ndlocr, "is_ready", return_value=False), \
                 mock.patch.object(native, "livetext_available", return_value=True):
             self.assertEqual(pipeline._vertical_engine("jpn_vert")[0], "livetext")
+
+
+def fake_corner_ink(image):
+    text = Path(image).read_text()
+    return 1.0 if "+sheet" in text else 0.014 if "+toolbar" in text else 0.0
+
+
+class FakeKindle:
+    """Just enough of Kindle for Mac to exercise page-turn detection.
+
+    Reproduces what broke a real capture: the first key press after focusing
+    is swallowed, and the backward key on the cover jumps to the last reading
+    position ("戻る") instead of doing nothing. Clicking the page toggles the
+    toolbar overlay.
+    """
+
+    def __init__(self, pages=12, vertical=False, jump_to=5, swallow_first=True,
+                 toolbar=False, focus_lost_at=None, dead_at=None):
+        self.pages, self.pos, self.jump_to = pages, 0, jump_to
+        self.forward = "left" if vertical else "right"
+        self.backward = "right" if vertical else "left"
+        self.swallow = swallow_first
+        self.overlay = toolbar
+        # Page where keys stop arriving until the reader is clicked again.
+        self.focus_lost_at, self.focused = focus_lost_at, True
+        # Page past which nothing turns forward at all (a stuck reader).
+        self.dead_at = dead_at
+        # After the last page Kindle dims the book behind its end-of-book
+        # sheet; clicking in it opens the notebook, and clicking a highlight
+        # there jumps back into the book.
+        self.view = "book"
+
+    def press(self, key):
+        if self.swallow:
+            self.swallow = False
+            return
+        if self.view != "book":
+            if key == "escape" and self.view == "sheet":
+                self.view = "book"
+            return
+        if key == self.forward and self.pos == self.pages - 1:
+            self.view = "sheet"
+            return
+        if self.pos == self.focus_lost_at and self.focused:
+            self.focused = False
+            self.focus_lost_at = None
+        if not self.focused:
+            return
+        if key == self.forward and self.pos == self.dead_at:
+            return
+        if key == self.forward:
+            self.pos = min(self.pos + 1, self.pages - 1)
+        elif key == self.backward:
+            self.pos = self.jump_to if self.pos == 0 else self.pos - 1
+
+    def click(self, window=None):
+        if self.view == "sheet":
+            self.view = "notebook"  # the click hit "ノートブックに移動"
+            return
+        if self.view == "notebook":
+            self.view, self.pos = "book", 5  # ... and then a highlight
+            return
+        self.overlay = not self.overlay
+        self.focused = True
+
+    def footer(self):
+        if self.view != "book":
+            return ""
+        return f"位置No. {self.pos * 3 + 1}/100・{self.pos * 100 // (self.pages - 1)}%"
+
+    def screen(self):
+        if self.view == "sheet":
+            return f"page{self.pos}+sheet"
+        if self.view == "notebook":
+            return "notebook"
+        return f"page{self.pos}" + ("+toolbar" if self.overlay else "")
+
+
+class TestPageTurnDirection(unittest.TestCase):
+    def _capture(self, kindle, max_pages=50):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td:
+            session = capture.CaptureSession(outdir=Path(td), next_key="auto")
+            same = lambda a, b: Path(a).read_text() == Path(b).read_text()
+            with mock.patch.object(capture, "preflight", return_value=[]), \
+                    mock.patch.object(capture, "activate"), \
+                    mock.patch.object(capture, "frontmost_bundle",
+                                      return_value=capture.KINDLE_BUNDLE), \
+                    mock.patch.object(capture, "focus_reader", side_effect=kindle.click), \
+                    mock.patch.object(capture, "send_key", side_effect=kindle.press), \
+                    mock.patch.object(capture.time, "sleep"), \
+                    mock.patch.object(capture.native, "compare", side_effect=lambda a, b, size=256: {
+                        "changed_frac": 0.0 if same(a, b) else 0.5}), \
+                    mock.patch.object(capture.CaptureSession, "_shot",
+                                      lambda self, wid, path: Path(path).write_text(
+                                          kindle.screen() + "|" + kindle.footer())), \
+                    mock.patch.object(capture, "corner_ink", fake_corner_ink), \
+                    mock.patch.object(capture.CaptureSession, "_footer",
+                                      lambda self, img: Path(img).read_text().split("|")[1]):
+                window = capture.KindleWindow(1, "Kindle", 0, 0, 100, 100)
+                session.run(max_pages, window=window)
+                return session.next_key, [
+                    (session.pages_dir / p["file"]).read_text().split("|")[0]
+                    for p in session.pages]
+
+    def test_left_bound_book_turns_right_from_the_cover(self):
+        key, pages = self._capture(FakeKindle(vertical=False))
+        self.assertEqual(key, "right")
+        self.assertEqual(pages, [f"page{i}" for i in range(12)])
+
+    def test_right_bound_book_turns_left_from_the_cover(self):
+        key, pages = self._capture(FakeKindle(vertical=True))
+        self.assertEqual(key, "left")
+        self.assertEqual(pages, [f"page{i}" for i in range(12)])
+
+    def test_toolbar_left_open_is_closed_before_capturing(self):
+        # Kindle keeps the toolbar up after a jump; one click must not reopen it.
+        key, pages = self._capture(FakeKindle(toolbar=True))
+        self.assertEqual(pages, [f"page{i}" for i in range(12)])
+
+    def test_end_of_book_sheet_ends_the_capture(self):
+        # The last page is followed by Kindle's sheet; nothing after it is a page.
+        kindle = FakeKindle()
+        key, pages = self._capture(kindle)
+        self.assertEqual(pages, [f"page{i}" for i in range(12)])
+        self.assertEqual(kindle.view, "book")  # the sheet was closed, not clicked
+
+    def test_a_stall_mid_book_is_recovered_not_taken_as_the_end(self):
+        key, pages = self._capture(FakeKindle(focus_lost_at=6))
+        self.assertEqual(pages, [f"page{i}" for i in range(12)])
+
+    def test_stuck_mid_book_stops_with_an_error_instead_of_finishing(self):
+        with self.assertRaises(capture.CaptureError) as ctx:
+            self._capture(FakeKindle(dead_at=4))
+        self.assertIn("not the end", str(ctx.exception))
+
+    def test_resume_keeps_the_page_left_on_screen(self):
+        # An error after a page turn leaves Kindle one page past the last save.
+        from unittest import mock
+        kindle = FakeKindle(swallow_first=False)
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td)
+            session = capture.CaptureSession(outdir=out, next_key="right")
+            session.pages_dir.mkdir(parents=True)
+            for i in range(3):
+                (session.pages_dir / f"page_{i + 1:05d}.png").write_text(
+                    f"page{i}|位置No. {i * 3 + 1}/100・{i * 9}%")
+                session.pages.append({"index": i + 1, "file": f"page_{i + 1:05d}.png"})
+            kindle.pos = 3  # page3 is on screen but was never saved
+            same = lambda a, b: Path(a).read_text() == Path(b).read_text()
+            with mock.patch.object(capture, "preflight", return_value=[]), \
+                    mock.patch.object(capture, "activate"), \
+                    mock.patch.object(capture, "frontmost_bundle",
+                                      return_value=capture.KINDLE_BUNDLE), \
+                    mock.patch.object(capture, "focus_reader", side_effect=kindle.click), \
+                    mock.patch.object(capture, "send_key", side_effect=kindle.press), \
+                    mock.patch.object(capture.time, "sleep"), \
+                    mock.patch.object(capture.native, "compare", side_effect=lambda a, b, size=256: {
+                        "changed_frac": 0.0 if same(a, b) else 0.5}), \
+                    mock.patch.object(capture.CaptureSession, "_shot",
+                                      lambda self, wid, path: Path(path).write_text(
+                                          kindle.screen() + "|" + kindle.footer())), \
+                    mock.patch.object(capture, "corner_ink", fake_corner_ink), \
+                    mock.patch.object(capture.CaptureSession, "_footer",
+                                      lambda self, img: Path(img).read_text().split("|")[1]):
+                session.run(50, window=capture.KindleWindow(1, "Kindle", 0, 0, 9, 9))
+            pages = [(session.pages_dir / p["file"]).read_text().split("|")[0]
+                     for p in session.pages]
+            self.assertEqual(pages, [f"page{i}" for i in range(12)])
+
+    def test_resume_keeps_the_verified_key(self):
+        from unittest import mock
+        from kindle2ai import cli
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td)
+            (out / "pages").mkdir()
+            (out / "pages" / "page_00001.png").write_text("page0")
+            (out / "state.json").write_text(json.dumps({
+                "next_key": "right", "pages": [{"index": 1, "file": "page_00001.png"}],
+                "book": {"title": "本", "asin": "X"}}))
+            seen = {}
+
+            def fake_run(session, *a, **k):
+                seen["key"] = session.next_key
+                return session.pages
+
+            args = cli.build_parser().parse_args(
+                ["capture", "--out", str(out), "--resume"])
+            with mock.patch.object(capture, "find_window",
+                                   return_value=capture.KindleWindow(1, "Kindle", 0, 0, 9, 9)), \
+                    mock.patch.object(capture.CaptureSession, "run", fake_run):
+                cli.cmd_capture(args)
+            self.assertEqual(seen["key"], "right")
+
+    def test_footer_ignores_body_text_above_it(self):
+        lines = [
+            {"text": "図表は131ページを参照", "x": 100, "y": 10, "w": 400, "h": 20},
+            {"text": "位置No. 78/2744", "x": 300, "y": 60, "w": 150, "h": 18},
+            {"text": "3%・第2章", "x": 460, "y": 61, "w": 80, "h": 18},
+        ]
+        footer = capture.footer_line(lines)
+        self.assertEqual(footer, "位置No. 78/2744 3%・第2章")
+        self.assertEqual(capture.parse_location(footer), 78)
+
+    def test_one_low_position_reading_does_not_stop_the_capture(self):
+        from unittest import mock
+        session = capture.CaptureSession(outdir=Path("."))
+        session.pages = [{"index": 1, "file": "first.png"}]
+        readings = iter([100, 10, 101, 102])
+        with mock.patch.object(session, "_same", return_value=False), \
+                mock.patch.object(session, "_location", side_effect=lambda img: next(readings)):
+            for _ in range(4):
+                session._guard_against_looping(Path("page.png"))
+        self.assertEqual(session._last_location, 102)
+
+    def test_footer_percent_is_parsed(self):
+        self.assertEqual(capture.parse_percent("10ページ中の10ページ目・21%・第2章"), 21)
+        self.assertIsNone(capture.parse_location("10ページ中の10ページ目・21%・第2章"))
+
+    def test_footer_position_is_parsed(self):
+        self.assertEqual(capture.parse_location("位置No. 26/2744・1%・はじめに"), 26)
+        self.assertEqual(capture.parse_location("Location 1,234 of 5,000"), 1234)
+        self.assertIsNone(capture.parse_location("ページ 131"))
+        self.assertIsNone(capture.parse_location("章を読み終えるまで1分・13%"))
 
 
 class TestUINoise(unittest.TestCase):

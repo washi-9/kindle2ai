@@ -29,66 +29,89 @@ def _formats(raw: str) -> list[str]:
 
 # --------------------------------------------------------------------------- doctor
 
-def cmd_doctor(args) -> int:
-    ok = True
-    print("kindle2ai doctor")
-    print("-" * 52)
+def doctor_checks(request: bool = False) -> list[dict]:
+    """Every setup check as {key, status: ok|warn|fail, label, detail, hint}."""
+    checks: list[dict] = []
+
+    def add(key, status, label, detail, hint=""):
+        checks.append({"key": key, "status": status, "label": label,
+                       "detail": detail, "hint": hint})
 
     try:
         native.ensure_binary()
-        print(f"[ok]   native helper   {native.BINARY}")
+        add("helper", "ok", "native helper", str(native.BINARY))
     except native.NativeError as e:
-        print(f"[FAIL] native helper   {e}")
-        return 1
+        add("helper", "fail", "native helper", str(e), "./setup.sh")
+        return checks
 
     langs = native.supported_languages()
-    print(f"[ok]   OCR languages   {len(langs)} available"
-          f" ({'ja-JP ' if 'ja-JP' in langs else ''}{'en-US' if 'en-US' in langs else ''})")
+    add("languages", "ok", "OCR languages",
+        f"{len(langs)} available"
+        f" ({'ja-JP ' if 'ja-JP' in langs else ''}{'en-US' if 'en-US' in langs else ''})")
 
-    perms = native.request_permissions() if args.request else native.permissions()
+    perms = native.request_permissions() if request else native.permissions()
     for key, label, why in (
         ("screen_recording", "Screen & System Audio Recording",
          "captures come out blank without it"),
         ("accessibility", "Accessibility", "page turns are ignored without it"),
     ):
         if perms.get(key):
-            print(f"[ok]   permission      {label}")
+            add(key, "ok", "permission", label)
         else:
-            ok = False
-            print(f"[FAIL] permission      {label} - {why}")
-            print(f"       System Settings > Privacy & Security > {label}")
-            print(f"       Add and enable your terminal app, then RESTART the terminal.")
+            who = perms.get("responsible") or "unknown"
+            add(key, "fail", "permission", f"{label} - {why} (checked for: {who})",
+                f"System Settings > Privacy & Security > {label}\n"
+                "Enable the app you run kindle2ai from (your terminal, or "
+                "Kindle2AI.app), then RESTART that app.")
 
     if ndlocr.is_ready():
-        print("[ok]   vertical JP     NDLOCR-Lite (most accurate for 縦書き)")
+        add("vertical", "ok", "vertical JP", "NDLOCR-Lite (most accurate for 縦書き)")
     elif native.livetext_available():
-        print("[ok]   vertical JP     Live Text (縦書き supported, no install needed)")
-        print("       Optional, about 1/3 the errors: ./setup-ndlocr.sh")
+        add("vertical", "ok", "vertical JP",
+            "Live Text (縦書き supported, no install needed)",
+            "Optional, about 1/3 the errors: ./setup-ndlocr.sh")
     elif tess.is_ready("jpn_vert"):
-        print("[ok]   vertical JP     Tesseract jpn_vert ready (縦書き supported)")
+        add("vertical", "ok", "vertical JP", "Tesseract jpn_vert ready (縦書き supported)")
     else:
-        print("[warn] vertical JP     " + tess.install_hint("jpn_vert").replace(
-            "\n", "\n       "))
-        print("       Horizontal books work without this; vertical ones do not.")
+        add("vertical", "warn", "vertical JP", tess.install_hint("jpn_vert"),
+            "Horizontal books work without this; vertical ones do not.")
 
     wins = native.windows(capture.KINDLE_BUNDLE)
     if wins:
         w = wins[0]
-        print(f"[ok]   Kindle window   id={w['id']} {int(w['width'])}x{int(w['height'])}"
-              f" {w.get('title') or '(title hidden)'}")
+        add("kindle", "ok", "Kindle window",
+            f"id={w['id']} {int(w['width'])}x{int(w['height'])}"
+            f" {w.get('title') or '(title hidden)'}")
     else:
-        ok = False
-        print("[FAIL] Kindle window   not found - open the Kindle app with a book open")
+        add("kindle", "fail", "Kindle window", "not found",
+            "open the Kindle app with a book open")
 
     if library.BOOK_DB.exists():
         try:
-            books = library.list_books()
-            print(f"[ok]   library index   {len(books)} books")
+            add("library", "ok", "library index", f"{len(library.list_books())} books")
         except Exception as e:
-            print(f"[warn] library index   {e}")
+            add("library", "warn", "library index", str(e))
     else:
-        print("[warn] library index   not found (only affects `books` listing)")
+        add("library", "warn", "library index",
+            "not found (only affects `books` listing)")
+    return checks
 
+
+def cmd_doctor(args) -> int:
+    checks = doctor_checks(request=args.request)
+    ok = all(c["status"] != "fail" for c in checks)
+    if args.json:
+        print(json.dumps({"ok": ok, "checks": checks}, ensure_ascii=False, indent=2))
+        return 0 if ok else 1
+
+    print("kindle2ai doctor")
+    print("-" * 52)
+    tags = {"ok": "[ok]  ", "warn": "[warn]", "fail": "[FAIL]"}
+    for c in checks:
+        print(f"{tags[c['status']]} {c['label']:<15} {c['detail']}".replace(
+            "\n", "\n       "))
+        if c["hint"] and (c["status"] != "ok" or c["key"] == "vertical"):
+            print("       " + c["hint"].replace("\n", "\n       "))
     print("-" * 52)
     print("ready" if ok else "fix the [FAIL] items above, then re-run `kindle2ai doctor`")
     if not args.request and not ok:
@@ -162,7 +185,11 @@ def cmd_capture(args) -> int:
     outdir = Path(args.out)
     session = capture.CaptureSession.load(outdir) if args.resume \
         else capture.CaptureSession(outdir=outdir)
-    session.next_key = args.next_key
+    # On resume, keep the key the first run verified: re-detecting it from a
+    # page in the middle of the book is ambiguous, and once turned a capture
+    # backwards toward the cover.
+    if not (args.resume and args.next_key == "auto" and session.next_key != "auto"):
+        session.next_key = args.next_key
     session.delay = args.delay
     session.end_repeats = args.end_repeats
     if not session.book:
@@ -419,6 +446,7 @@ def build_parser() -> argparse.ArgumentParser:
     d = sub.add_parser("doctor", help="check permissions and setup")
     d.add_argument("--request", action="store_true",
                    help="trigger the macOS permission prompts")
+    d.add_argument("--json", action="store_true", help="machine-readable output")
     d.set_defaults(func=cmd_doctor)
 
     b = sub.add_parser("books", help="list books in the local Kindle library")
