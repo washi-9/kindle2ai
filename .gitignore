@@ -1,0 +1,9 @@
+# Captured pages and OCR output are copies of copyrighted books: never commit.
+out/
+
+# Reproducible with ./setup.sh and ./setup-ndlocr.sh
+build/
+
+__pycache__/
+*.pyc
+.DS_Store

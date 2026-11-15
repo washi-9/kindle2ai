@@ -1,0 +1,5 @@
+#!/bin/sh
+# kindle2ai launcher - no virtualenv, no pip dependencies.
+# -u keeps per-page progress visible when output is piped or logged.
+DIR=$(cd "$(dirname "$0")/.." && pwd)
+exec /usr/bin/env PYTHONPATH="$DIR/src${PYTHONPATH:+:$PYTHONPATH}" python3 -u -m kindle2ai.cli "$@"
